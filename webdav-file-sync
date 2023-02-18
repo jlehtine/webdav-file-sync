@@ -1,0 +1,390 @@
+#! /bin/sh
+
+# webdav-file-sync
+# Copyright (c) 2023 Johannes Lehtinen
+
+# Stop on error
+set -e
+
+# Find script name
+scriptdir="$(dirname "$0")"
+scriptname="$(basename "$0")"
+
+# Use secure umask
+umask 077
+
+# Show error and exit
+error () {
+    echo "ERROR: $*" 1>&2
+    exit 1
+}
+
+# Prints help and exits
+print_help () {
+    cat <<EOS
+usage: $scriptname [OPTIONS] COMMAND ARGS...
+
+commands:
+  help          print help and exit
+  config        initialize configuration
+  sync          synchronize all configured files
+  sync FILE     synchronize the configured FILE
+  put FILE      upload configured FILE overwriting any remote changes
+  get FILE      download configured FILE overwriting any local changes
+
+options:
+  -h            print help and exit
+  -v            be more verbose
+  -c CONF       use configuration file CONF
+  -o            overwrite the local changes on conflict during sync
+  -O            overwrite the remote changes on conflict during sync
+  -f            overwrite the remote or local changes without confirmation
+  -L            do NOT use WebDAV locking when syncing
+EOS
+    exit 0
+}
+
+# Read options
+conf=~/.webdav-file-sync.env
+overwrite=
+force=
+skiplocking=
+verbose=
+while getopts 'hvc:oOfL' opt; do
+    case "$opt" in
+        h)
+            print_help
+            ;;
+        v)
+            verbose=true
+            ;;
+        c)
+            conf="$OPTARG"
+            ;;
+        o)
+            overwrite=local
+            ;;
+        O)
+            overwrite=remote
+            ;;
+        f)
+            force=true
+            ;;
+        L)
+            skiplocking=true
+            ;;
+        '?')
+            error "Unrecognized option (try -h for help)"
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+# Read command
+[ $# -ge 1 ] || error "Command not specified (try -h for help)"
+cmd="$1"
+shift
+
+# Check the number of arguments to command
+check_cmd_args () {
+    if [ "$1" -lt "$2" ]; then
+        error "Command arguments missing (try -h for help)"
+    elif [ "$1" -gt "$3" ]; then
+        error "Unexpected command arguments provided (try -h for help)"
+    fi
+}
+
+# Check for required external tools
+check_tools () {
+    [ -z "$verbose" ] || echo 'Checking tools...'
+    type wget > /dev/null 2>&1 || error "Required tools missing: wget"
+    type lockfile-create > /dev/null 2>&1 || error "Required tools missing: lockfile-progs (lockfile-create, etc.)"
+    [ -z "$SYNC_ASKPASS" ] || [ -x "$SYNC_ASKPASS" ] || error "Credentials providing script not found or not executable: $SYNC_ASKPASS"
+}
+
+# Select specific configured file
+select_file () {
+    selectedfile="$1"
+    echo "$selectedfile" | grep -q -E -x '[a-zA-Z0-9_]+' || error "Invalid file identifier: $selectedfile"
+    eval filelocal=\"\${SYNC_FILE_$selectedfile}\"
+    [ -n "$filelocal" ] || error "Missing configuration setting: SYNC_FILE_$selectedfile"
+    [ "$filelocal" != "${filelocal#'/'}" ] || error "Absolute file path expected: SYNC_FILE_$selectedfile=$filelocal"
+    eval fileremote=\"\${SYNC_FILE_${selectedfile}_REMOTE}\"
+    fileremote="${fileremote#'/'}"
+    if [ -z "$fileremote" ]; then
+        fileremote="$(basename "$filelocal")"
+    fi
+    fileremote="$SYNC_REMOTE_BASE_URL$fileremote"
+}
+
+# Load configuration
+load_configuration () {
+    [ -z "$verbose" ] || echo 'Loading configuration...'
+
+    # Check that file exists and is readable
+    [ -f "$conf" ] || error "Configuration file not found (try -h for help): $conf"
+    [ -r "$conf" ] || error "Configuration file is not readable: $conf"
+
+    # Check that file is safe to use
+    if [ "$(find "$conf" \( -user "$(id -u)" -o -user 0 \) ! -perm /077 -print)" != "$conf" ]; then
+        error "Configuration file must not be accessible by other non-root users: $conf"
+    fi
+
+    # Set defaults
+    SYNC_STATE_DIR=~/.webdav-file-sync/state
+    SYNC_BACKUP_DIR=~/.webdav-file-sync/backup
+    SYNC_BACKUP_NUM=10
+    SYNC_BACKUP_DAYS=30
+
+    # Source configuration
+    . "$conf"
+
+    # Check configuration
+    [ -n "$SYNC_ASKPASS" ] || error "Missing configuration setting: SYNC_ASKPASS"
+    [ -n "$SYNC_REMOTE_BASE_URL" ] || error "Missing configuration setting: SYNC_REMOTE_BASE_URL"
+    SYNC_REMOTE_BASE_URL="${SYNC_REMOTE_BASE_URL%'/'}/"
+    [ -n "$SYNC_FILES" ] || error "Missing configuration setting: SYNC_FILES"
+    for f in $SYNC_FILES; do
+        select_file "$f"
+    done
+}
+
+# Authenticate, if necessary
+authenticate () {
+    if [ -z "$SYNC_REMOTE_USER" -o -z "$SYNC_REMOTE_PASSWORD" ]; then
+        remotename="$(echo "$SYNC_REMOTE_BASE_URL" | sed -e 's/^https\?:\/\/\([^\/]*\).*$/\1/')"
+
+        # If terminal available
+        if [ -t 0 ]; then
+            if [ -z "$SYNC_REMOTE_USER" ]; then
+                printf '%s' "Username for $remotename: "
+                read SYNC_REMOTE_USER || error 'Failed to read username from terminal'
+            fi
+            if [ -z "$SYNC_REMOTE_PASSWORD" ]; then
+                printf '%s' "Password for $SYNC_REMOTE_USER@$remotename: "
+                set +e
+                stty -echo
+                read SYNC_REMOTE_PASSWORD
+                ret=$?
+                printf '\n'
+                stty echo
+                set -e
+                [ $ret -eq 0 ] || error 'Failed to read password from terminal'
+            fi
+
+        # Otherwise try Zenity
+        else
+            if [ -z "$SYNC_REMOTE_USER" ]; then
+                creds="$(zenity --password --username --title="Credentials for $remotename")" || error 'Failed to request credentials'
+                SYNC_REMOTE_USER="$(echo "$creds" | sed -e 's/|.*$//')"
+                SYNC_REMOTE_PASSWORD="$(echo "$creds" | sed -e 's/^[^|]*|//')"
+            else
+                SYNC_REMOTE_PASSWORD="$(zenity --password --title="Password for $SYNC_REMOTE_USER@$remotename")" || error 'Failed to request password'
+            fi
+        fi
+    fi
+    export SYNC_REMOTE_USER SYNC_REMOTE_PASSWORD
+}
+
+# Do wget operation with standard options
+wget_do () {
+    if [ -n "$locktoken" ]; then
+        wget -q --use-askpass="$SYNC_ASKPASS" --header="Lock-Token: $locktoken" "$@"
+    else
+        wget -q --use-askpass="$SYNC_ASKPASS" "$@"
+    fi
+}
+
+# Upload file to remote using PUT
+webdav_put () {
+    [ -z "$verbose" ] || echo "Uploading: $filelocal --> $fileremote"
+    wget_do -t 3 -O /dev/null --method=PUT --body-file="$filelocal" "$fileremote" || return 1
+    [ -z "$verbose" ] || echo 'Upload complete.'
+}
+
+# Download file from remote using GET
+webdav_get () {
+    [ -z "$verbose" ] || echo "Downloading: $fileremote --> $filelocal"
+    tmpfile="$(mktemp "$(dirname "$filelocal")/.$(basename "$filelocal").XXXXXX")"
+    wget_do -t 3 -O "$tmpfile" --method=GET "$fileremote" || return 1
+    if [ -e "$filelocal" ]; then
+        chmod --reference="$filelocal" "$tmpfile"
+    fi
+    mv "$tmpfile" "$filelocal"
+    [ -z "$verbose" ] || echo 'Download complete.'
+}
+
+# Lock selected file
+webdav_lock () {
+    [ -z "$verbose" ] || echo "Locking: $fileremote"
+    tmpfile="$(mktemp -t "$scriptname.XXXXXX")"
+    wget_do -t 3 -O /dev/null -S --method=LOCK --header='Depth: 0' --header='Timeout: Second-300' --header='Content-Type: application/xml; charset="utf-8"' --body-data='<?xml version="1.0" encoding="utf-8" ?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>' "$fileremote" 2> "$tmpfile"
+    ret=$?
+    if [ $ret -eq 0 ]; then
+        locktoken="$(cat "$tmpfile" | grep -E '^\s*Lock-Token:' | sed -e 's/^\s*Lock-Token:\s*//')"
+    fi
+    rm -f "$tmpfile"
+    tmpfile=
+    [ "$ret" -eq 0 -a -n "$locktoken" ] || return 1
+}
+
+# Unlock selected file
+webdav_unlock () {
+    local lt
+    [ -n "$locktoken" ] || return 0
+    [ -z "$verbose" ] || echo "Unlocking: $fileremote"
+    lt="$locktoken"
+    locktoken=
+    wget_do -t 3 -O /dev/null --method=UNLOCK --header="Lock-Token: $lt" "$fileremote" || return 1
+}
+
+# Do syncing of selected file
+webdav_sync () {
+    [ -z "$verbose" ] || echo "Synchronizing: $filelocal <--> $fileremote"
+    [ -n "$skiplocking" ] || webdav_lock || { echo "ERROR: Locking failed: $fileremote" 1>&2; return 1; }
+
+
+    [ -n "$skiplocking" ] || webdav_unlock || echo "WARNING: Unlocking failed: $fileremote" 1>&2
+}
+
+# Command: print help
+cmd_help () {
+    check_cmd_args $# 0 0
+    print_help
+}
+
+# Try to set SYNC_ASKPASS
+try_askpass () {
+    if [ -z "$SYNC_ASKPASS" ]; then
+        if [ -x "$1" ]; then
+            SYNC_ASKPASS="$1"
+        fi
+    fi
+}
+
+# Command: initialize configuration
+cmd_config () {
+    check_cmd_args $# 0 0
+    check_tools
+
+    # Check for existing configuration
+    if [ -e "$conf" ]; then
+        echo "Configuration file already exists: $conf"
+        echo "Edit its contents as necessary or remove it to reinitialize."
+        exit 0
+    fi
+
+    # Determine askpass script location
+    default_askpass="$(cd "$scriptdir" && pwd)/libexec/webdav-file-sync-askpass"
+    try_askpass "$default_askpass"
+    try_askpass "/usr/local/lib/webdav-file-sync/webdav-file-sync-askpass"
+    try_askpass "/usr/libexec/webdav-file-sync/webdav-file-sync-askpass"
+    SYNC_ASKPASS="${SYNC_ASKPASS:-$default_askpass}"
+
+    # Initialize a configuration file
+    cat > "$conf" <<EOS
+# $scriptname configuration file
+
+# This file is sourced to shell when using the script.
+# This file might contain passwords and must have safe file permissions.
+
+# The example values are commented out so that they are not used accidentally.
+# Remove the preceding hash when setting them to a correct value.
+
+# Absolute path to credentials providing script (required)
+SYNC_ASKPASS='$SYNC_ASKPASS'
+
+# Remote sync location base URL (mandatory)
+#SYNC_REMOTE_BASE_URL='https://example.org/sync/root/'
+
+# Remote user (optional, asked if not provided here)
+#SYNC_REMOTE_USER='myuser'
+
+# Remote password (optional, asked if not provided here)
+#SYNC_REMOTE_PASSWORD='mypassword'
+
+# One or more files to be synchronized (mandatory)
+# The short identifiers given in SYNC_FILES must be valid variable names.
+# These identifiers are used as an argument to "sync", "put" or "get".
+# If remote path is not specified then it is assumed to be the file basename. 
+#SYNC_FILES='first second third'
+#SYNC_FILE_first='/path/to/my/first file.txt'
+#SYNC_FILE_second='/path/to/my/second file.pdf'
+#SYNC_FILE_second_REMOTE='folder/second.pdf'
+#SYNC_FILE_third='/path/to/my/third file.txt'
+#SYNC_FILE_third_REMOTE='remote third.txt'
+
+# The directories used for state and backup copies (default values)
+#SYNC_STATE_DIR=~/.webdav-file-sync/state
+#SYNC_BACKUP_DIR=~/.webdav-file-sync/backup
+
+# Minimum number of backup copies kept per file (default value)
+#SYNC_BACKUP_NUM=10
+
+# How long to keep backup copies in days (default value)
+#SYNC_BACKUP_DAYS=30
+EOS
+    echo "Example configuration file was created: $conf"
+    echo "Edit its contents as necessary."
+}
+
+# Command: sync
+cmd_sync () {
+    local f
+    check_cmd_args $# 0 1
+    load_configuration
+    check_tools
+    authenticate
+    if [ $# -ge 1 ]; then
+        select_file "$1"
+        webdav_sync || error "Synchronization failed: $1"
+    else
+        errors=
+        for f in $SYNC_FILES; do
+            select_file "$f"
+            webdav_sync || {
+                echo "ERROR: Synchronization failed: $f" 1>&2
+                errors=true
+            }
+        done
+        [ -z "$errors" ] || error "Synchronization failed for one or more files"
+    fi
+}
+
+# Command: put file to remote
+cmd_put () {
+    check_cmd_args $# 1 1
+    load_configuration
+    check_tools
+    select_file "$1"
+    authenticate
+    webdav_put || error "Upload failed"
+}
+
+# Command: get file from remote
+cmd_get () {
+    check_cmd_args $# 1 1
+    load_configuration
+    check_tools
+    select_file "$1"
+    authenticate
+    webdav_get || error "Download failed"
+}
+
+# Cleanup for temporary files and directories
+tmpdir=
+tmpfile=
+locktoken=
+trap '[ -z "$locktoken" ] || webdav_unlock; [ -z "$tmpdir" ] || rm -rf "$tmpdir"; [ -z "$tmpfile" ] || rm -f "$tmpfile"' 0
+
+# Perform the command
+case "$cmd" in
+
+    help|config|sync|put|get)
+        "cmd_$cmd" "$@"
+        ;;
+
+    *)
+        error "Unknown command: $cmd, try -h for help"
+        ;;
+esac
