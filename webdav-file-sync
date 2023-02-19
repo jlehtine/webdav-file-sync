@@ -3,25 +3,30 @@
 # webdav-file-sync
 # Copyright (c) 2023 Johannes Lehtinen
 
+# Stop on error
+set -e
+
 # Check if executed as an askpass script to access keyring
-if [ -n "$SYNC_REMOTE_USER" -a -n "$SYNC_REMOTE_TARGET" -a -n "$SYNC_KEYRING_UTILITY" ]; then
+if [ -n "$SYNC_REMOTE_USER" -a -n "$SYNC_REMOTE_TARGET" ]; then
     case "$*" in
         'Username for '*)
             echo "$SYNC_REMOTE_USER"
             exit 0
             ;;
         'Password for '*)
-            backendopt=
-            if [ -n "$SYNC_KEYRING_BACKEND" ]; then
-                backendopt="-b $SYNC_KEYRING_BACKEND"
+            if [ -n "$SYNC_KEYRING_UTILITY" ]; then
+                backendopt=
+                if [ -n "$SYNC_KEYRING_BACKEND" ]; then
+                    backendopt="-b $SYNC_KEYRING_BACKEND"
+                fi
+                exec "$SYNC_KEYRING_UTILITY" $backendopt get "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
+            else
+                exec "$SYNC_ASKPASS" "$@"
+                exit $?
             fi
-            exec "$SYNC_KEYRING_UTILITY" $backendopt get "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
             ;;
     esac
 fi
-
-# Stop on error
-set -e
 
 # Find script name
 scriptdir="$(dirname "$0")"
@@ -176,17 +181,16 @@ load_configuration () {
 
     # Export information required to access the credentials
     if [ -n "$SYNC_REMOTE_USER" ]; then
+        [ -n "$SYNC_KEYRING_UTILITY" ] || [ -n "$SYNC_ASKPASS" ] || error "Invalid configuration, either keyring must be enabled or askpass must be specified."
         SYNC_REMOTE_TARGET="$(echo "$SYNC_REMOTE_BASE_URL" | sed -e 's/^\(https\?:\/\/[^/]*\)\(\/.*\)\?$/\1/')"
-        export SYNC_REMOTE_USER SYNC_REMOTE_TARGET SYNC_KEYRING_UTILITY SYNC_KEYRING_BACKEND
+        export SYNC_REMOTE_USER SYNC_REMOTE_TARGET SYNC_KEYRING_UTILITY SYNC_KEYRING_BACKEND SYNC_ASKPASS
     fi
 }
 
 # Asks user for a password and outputs it
 ask_password () {
     prompt="Password for $SYNC_REMOTE_USER at $SYNC_REMOTE_TARGET: "
-    if [ -n "$SYNC_ASKPASS" ]; then
-        "$SYNC_ASKPASS" "$prompt"
-    elif [ -t 0 ]; then
+    if [ -t 0 -a -t 2 ]; then
         passwd=
         printf '%s' "$prompt" 1>&2
         stty -echo
@@ -195,8 +199,14 @@ ask_password () {
         stty echo
         echo "$passwd"
         unset passwd
-    else
+    elif [ -n "$SYNC_ASKPASS" ]; then
+        "$SYNC_ASKPASS" "$prompt"
+    elif type ssh-askpass > /dev/null 2>&1; then
+        ssh-askpass "$prompt"
+    elif type zenity > /dev/null 2>&1; then
         zenity --password --title="$prompt"
+    else
+        error "Can not use any method to request password"
     fi
 }
 
@@ -205,26 +215,11 @@ wget_do () {
 
     # Authenticated requests
     if [ -n "$SYNC_REMOTE_USER" ]; then
-
-        # Using keyring or askpass
-        if [ -n "$SYNC_KEYRING_UTILITY" -o -n "$SYNC_ASKPASS" ]; then
-            askpass="$SYNC_ASKPASS"
-            if [ -n "$SYNC_KEYRING_UTILITY" ]; then
-                askpass="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-            fi
-            if [ -n "$locktoken" ]; then
-                wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" --header="Lock-Token: $locktoken" "$@"
-            else
-                wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" "$@"
-            fi
-
-        # Asking password for each request
+        askpass="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+        if [ -n "$locktoken" ]; then
+            wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" --header="Lock-Token: $locktoken" "$@" 3>&2
         else
-            if [ -n "$locktoken" ]; then
-                wget -q --user="$SYNC_REMOTE_USER" --ask-password --header="Lock-Token: $locktoken" "$@"
-            else
-                wget -q --user="$SYNC_REMOTE_USER" --ask-password "$@"
-            fi
+            wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" "$@" 3>&2
         fi
 
     # Unauthenticated requests
@@ -340,12 +335,12 @@ cmd_config () {
 # The keyring utility to use as a password storage (default values)
 # This is expected to be the Python keyring utility or have the same API.
 # To disable keyring set the keyring utility to an empty value.
-# If keyring is not used then a password will be asked for each request.
+# If keyring is disabled then a password will be asked for each request.
 # An empty backend value designates the default backend.
 #SYNC_KEYRING_UTILITY=keyring
 #SYNC_KEYRING_BACKEND=keyring.backends.SecretService.Keyring
 
-# The askpass utility to use (optional)
+# The askpass utility to use (optional, if keyring enabled)
 # If specified then it will be used to ask the credentials when necessary.
 # By default the credentials will be asked on the terminal.
 #SYNC_ASKPASS=ssh-askpass
