@@ -3,6 +3,23 @@
 # webdav-file-sync
 # Copyright (c) 2023 Johannes Lehtinen
 
+# Check if executed as an askpass script to access keyring
+if [ -n "$SYNC_REMOTE_USER" -a -n "$SYNC_REMOTE_TARGET" -a -n "$SYNC_KEYRING_UTILITY" ]; then
+    case "$*" in
+        'Username for '*)
+            echo "$SYNC_REMOTE_USER"
+            exit 0
+            ;;
+        'Password for '*)
+            backendopt=
+            if [ -n "$SYNC_KEYRING_BACKEND" ]; then
+                backendopt="-b $SYNC_KEYRING_BACKEND"
+            fi
+            exec "$SYNC_KEYRING_UTILITY" $backendopt get "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
+            ;;
+    esac
+fi
+
 # Stop on error
 set -e
 
@@ -26,9 +43,11 @@ usage: $scriptname [OPTIONS] COMMAND ARGS...
 
 commands:
   help          print help and exit
-  config        initialize configuration
-  sync          synchronize all configured files
-  sync FILE     synchronize the configured FILE
+  config        initialize and setup configuration
+  auth          initialize keyring authencation
+  sync          synchronize all configured files once
+  sync FILE     synchronize the configured FILE once
+  sync-repeat   synchronize all configured files repeatedly until killed
   put FILE      upload configured FILE overwriting any remote changes
   get FILE      download configured FILE overwriting any local changes
 
@@ -99,7 +118,10 @@ check_tools () {
     [ -z "$verbose" ] || echo 'Checking tools...'
     type wget > /dev/null 2>&1 || error "Required tools missing: wget"
     type lockfile-create > /dev/null 2>&1 || error "Required tools missing: lockfile-progs (lockfile-create, etc.)"
-    [ -z "$SYNC_ASKPASS" ] || [ -x "$SYNC_ASKPASS" ] || error "Credentials providing script not found or not executable: $SYNC_ASKPASS"
+    if [ -n "$SYNC_REMOTE_USER" ]; then
+        [ -z "$SYNC_KEYRING_UTILITY" ] || type "$SYNC_KEYRING_UTILITY" > /dev/null 2>&1 || error "Keyring utility not found or not executable: $SYNC_KEYRING_UTILITY (Python keyring)"
+        [ -z "$SYNC_ASKPASS" ] || type "$SYNC_ASKPASS" > /dev/null 2>&1 || error "Credentials providing script not found or not executable: $SYNC_ASKPASS"
+    fi
 }
 
 # Select specific configured file
@@ -125,12 +147,16 @@ load_configuration () {
     [ -f "$conf" ] || error "Configuration file not found (try -h for help): $conf"
     [ -r "$conf" ] || error "Configuration file is not readable: $conf"
 
-    # Check that file is safe to use
-    if [ "$(find "$conf" \( -user "$(id -u)" -o -user 0 \) ! -perm /077 -print)" != "$conf" ]; then
-        error "Configuration file must not be accessible by other non-root users: $conf"
+    # Check that the file is safe to use
+    if [ "$(find "$conf" \( -user "$(id -u)" -o -user 0 \) ! -perm /022 -print)" != "$conf" ]; then
+        error "Configuration file must not be writable by other non-root users: $conf"
     fi
 
     # Set defaults
+    SYNC_REPEAT_MINUTES=60
+    SYNC_KEYRING_UTILITY=keyring
+    SYNC_KEYRING_BACKEND=keyring.backends.SecretService.Keyring
+    SYNC_ASKPASS=
     SYNC_STATE_DIR=~/.webdav-file-sync/state
     SYNC_BACKUP_DIR=~/.webdav-file-sync/backup
     SYNC_BACKUP_NUM=10
@@ -140,58 +166,74 @@ load_configuration () {
     . "$conf"
 
     # Check configuration
-    [ -n "$SYNC_ASKPASS" ] || error "Missing configuration setting: SYNC_ASKPASS"
     [ -n "$SYNC_REMOTE_BASE_URL" ] || error "Missing configuration setting: SYNC_REMOTE_BASE_URL"
+    echo "$SYNC_REMOTE_BASE_URL" | grep -q -E '^https?://' || error "Invalid configuration value: SYNC_REMOTE_BASE_URL=$SYNC_REMOTE_BASE_URL"
     SYNC_REMOTE_BASE_URL="${SYNC_REMOTE_BASE_URL%'/'}/"
     [ -n "$SYNC_FILES" ] || error "Missing configuration setting: SYNC_FILES"
     for f in $SYNC_FILES; do
         select_file "$f"
     done
+
+    # Export information required to access the credentials
+    if [ -n "$SYNC_REMOTE_USER" ]; then
+        SYNC_REMOTE_TARGET="$(echo "$SYNC_REMOTE_BASE_URL" | sed -e 's/^\(https\?:\/\/[^/]*\)\(\/.*\)\?$/\1/')"
+        export SYNC_REMOTE_USER SYNC_REMOTE_TARGET SYNC_KEYRING_UTILITY SYNC_KEYRING_BACKEND
+    fi
 }
 
-# Authenticate, if necessary
-authenticate () {
-    if [ -z "$SYNC_REMOTE_USER" -o -z "$SYNC_REMOTE_PASSWORD" ]; then
-        remotename="$(echo "$SYNC_REMOTE_BASE_URL" | sed -e 's/^https\?:\/\/\([^\/]*\).*$/\1/')"
-
-        # If terminal available
-        if [ -t 0 ]; then
-            if [ -z "$SYNC_REMOTE_USER" ]; then
-                printf '%s' "Username for $remotename: "
-                read SYNC_REMOTE_USER || error 'Failed to read username from terminal'
-            fi
-            if [ -z "$SYNC_REMOTE_PASSWORD" ]; then
-                printf '%s' "Password for $SYNC_REMOTE_USER@$remotename: "
-                set +e
-                stty -echo
-                read SYNC_REMOTE_PASSWORD
-                ret=$?
-                printf '\n'
-                stty echo
-                set -e
-                [ $ret -eq 0 ] || error 'Failed to read password from terminal'
-            fi
-
-        # Otherwise try Zenity
-        else
-            if [ -z "$SYNC_REMOTE_USER" ]; then
-                creds="$(zenity --password --username --title="Credentials for $remotename")" || error 'Failed to request credentials'
-                SYNC_REMOTE_USER="$(echo "$creds" | sed -e 's/|.*$//')"
-                SYNC_REMOTE_PASSWORD="$(echo "$creds" | sed -e 's/^[^|]*|//')"
-            else
-                SYNC_REMOTE_PASSWORD="$(zenity --password --title="Password for $SYNC_REMOTE_USER@$remotename")" || error 'Failed to request password'
-            fi
-        fi
+# Asks user for a password and outputs it
+ask_password () {
+    prompt="Password for $SYNC_REMOTE_USER at $SYNC_REMOTE_TARGET: "
+    if [ -n "$SYNC_ASKPASS" ]; then
+        "$SYNC_ASKPASS" "$prompt"
+    elif [ -t 0 ]; then
+        passwd=
+        printf '%s' "$prompt" 1>&2
+        stty -echo
+        read passwd || true
+        printf '\n' 1>&2
+        stty echo
+        echo "$passwd"
+        unset passwd
+    else
+        zenity --password --title="$prompt"
     fi
-    export SYNC_REMOTE_USER SYNC_REMOTE_PASSWORD
 }
 
 # Do wget operation with standard options
 wget_do () {
-    if [ -n "$locktoken" ]; then
-        wget -q --use-askpass="$SYNC_ASKPASS" --header="Lock-Token: $locktoken" "$@"
+
+    # Authenticated requests
+    if [ -n "$SYNC_REMOTE_USER" ]; then
+
+        # Using keyring or askpass
+        if [ -n "$SYNC_KEYRING_UTILITY" -o -n "$SYNC_ASKPASS" ]; then
+            askpass="$SYNC_ASKPASS"
+            if [ -n "$SYNC_KEYRING_UTILITY" ]; then
+                askpass="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+            fi
+            if [ -n "$locktoken" ]; then
+                wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" --header="Lock-Token: $locktoken" "$@"
+            else
+                wget -q --user="$SYNC_REMOTE_USER" --use-askpass="$askpass" "$@"
+            fi
+
+        # Asking password for each request
+        else
+            if [ -n "$locktoken" ]; then
+                wget -q --user="$SYNC_REMOTE_USER" --ask-password --header="Lock-Token: $locktoken" "$@"
+            else
+                wget -q --user="$SYNC_REMOTE_USER" --ask-password "$@"
+            fi
+        fi
+
+    # Unauthenticated requests
     else
-        wget -q --use-askpass="$SYNC_ASKPASS" "$@"
+        if [ -n "$locktoken" ]; then
+            wget -q --header="Lock-Token: $locktoken" "$@"
+        else
+            wget -q "$@"
+        fi
     fi
 }
 
@@ -253,15 +295,6 @@ cmd_help () {
     print_help
 }
 
-# Try to set SYNC_ASKPASS
-try_askpass () {
-    if [ -z "$SYNC_ASKPASS" ]; then
-        if [ -x "$1" ]; then
-            SYNC_ASKPASS="$1"
-        fi
-    fi
-}
-
 # Command: initialize configuration
 cmd_config () {
     check_cmd_args $# 0 0
@@ -274,34 +307,15 @@ cmd_config () {
         exit 0
     fi
 
-    # Determine askpass script location
-    default_askpass="$(cd "$scriptdir" && pwd)/libexec/webdav-file-sync-askpass"
-    try_askpass "$default_askpass"
-    try_askpass "/usr/local/lib/webdav-file-sync/webdav-file-sync-askpass"
-    try_askpass "/usr/libexec/webdav-file-sync/webdav-file-sync-askpass"
-    SYNC_ASKPASS="${SYNC_ASKPASS:-$default_askpass}"
-
     # Initialize a configuration file
     cat > "$conf" <<EOS
 # $scriptname configuration file
 
 # This file is sourced to shell when using the script.
-# This file might contain passwords and must have safe file permissions.
+# This file must not be writable by others to prevent command injection.
 
 # The example values are commented out so that they are not used accidentally.
 # Remove the preceding hash when setting them to a correct value.
-
-# Absolute path to credentials providing script (required)
-SYNC_ASKPASS='$SYNC_ASKPASS'
-
-# Remote sync location base URL (mandatory)
-#SYNC_REMOTE_BASE_URL='https://example.org/sync/root/'
-
-# Remote user (optional, asked if not provided here)
-#SYNC_REMOTE_USER='myuser'
-
-# Remote password (optional, asked if not provided here)
-#SYNC_REMOTE_PASSWORD='mypassword'
 
 # One or more files to be synchronized (mandatory)
 # The short identifiers given in SYNC_FILES must be valid variable names.
@@ -313,6 +327,28 @@ SYNC_ASKPASS='$SYNC_ASKPASS'
 #SYNC_FILE_second_REMOTE='folder/second.pdf'
 #SYNC_FILE_third='/path/to/my/third file.txt'
 #SYNC_FILE_third_REMOTE='remote third.txt'
+
+# How often to synchronize the files when doing sync-repeat (default value)
+#SYNC_REPEAT_MINUTES=60
+
+# Remote sync location base URL (mandatory)
+#SYNC_REMOTE_BASE_URL='https://example.org/sync/root/'
+
+# Remote user (optional, unauthenticated if not specified)
+#SYNC_REMOTE_USER='myuser'
+
+# The keyring utility to use as a password storage (default values)
+# This is expected to be the Python keyring utility or have the same API.
+# To disable keyring set the keyring utility to an empty value.
+# If keyring is not used then a password will be asked for each request.
+# An empty backend value designates the default backend.
+#SYNC_KEYRING_UTILITY=keyring
+#SYNC_KEYRING_BACKEND=keyring.backends.SecretService.Keyring
+
+# The askpass utility to use (optional)
+# If specified then it will be used to ask the credentials when necessary.
+# By default the credentials will be asked on the terminal.
+#SYNC_ASKPASS=ssh-askpass
 
 # The directories used for state and backup copies (default values)
 #SYNC_STATE_DIR=~/.webdav-file-sync/state
@@ -326,6 +362,21 @@ SYNC_ASKPASS='$SYNC_ASKPASS'
 EOS
     echo "Example configuration file was created: $conf"
     echo "Edit its contents as necessary."
+    echo "Then run \"$scriptname auth\" if you want to setup keyring authentication."
+}
+
+# Command: auth
+cmd_auth () {
+    check_cmd_args $# 0 0
+    load_configuration
+    check_tools
+    [ -n "$SYNC_REMOTE_USER" ] || error "To use authenticated requests, set SYNC_REMOTE_USER in configuration: $conf"
+    [ -n "$SYNC_KEYRING_UTILITY" ] || error "To use keyring authentication, set SYNC_KEYRING_UTILITY in configuration: $conf"
+    backendopt=
+    if [ -n "$SYNC_KEYRING_BACKEND" ]; then
+        backendopt="-b $SYNC_KEYRING_BACKEND"
+    fi
+    ask_password | "$SYNC_KEYRING_UTILITY" $backendopt set "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
 }
 
 # Command: sync
@@ -334,7 +385,6 @@ cmd_sync () {
     check_cmd_args $# 0 1
     load_configuration
     check_tools
-    authenticate
     if [ $# -ge 1 ]; then
         select_file "$1"
         webdav_sync || error "Synchronization failed: $1"
@@ -357,7 +407,6 @@ cmd_put () {
     load_configuration
     check_tools
     select_file "$1"
-    authenticate
     webdav_put || error "Upload failed"
 }
 
@@ -367,7 +416,6 @@ cmd_get () {
     load_configuration
     check_tools
     select_file "$1"
-    authenticate
     webdav_get || error "Download failed"
 }
 
@@ -380,7 +428,7 @@ trap '[ -z "$locktoken" ] || webdav_unlock; [ -z "$tmpdir" ] || rm -rf "$tmpdir"
 # Perform the command
 case "$cmd" in
 
-    help|config|sync|put|get)
+    help|config|auth|sync|put|get)
         "cmd_$cmd" "$@"
         ;;
 
