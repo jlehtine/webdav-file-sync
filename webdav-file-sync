@@ -3,9 +3,6 @@
 # webdav-file-sync
 # Copyright (c) 2023 Johannes Lehtinen
 
-# Stop on error
-set -e
-
 # Check if executed as an askpass script to access keyring
 if [ -n "$SYNC_REMOTE_USER" -a -n "$SYNC_REMOTE_TARGET" ]; then
     case "$*" in
@@ -22,24 +19,24 @@ if [ -n "$SYNC_REMOTE_USER" -a -n "$SYNC_REMOTE_TARGET" ]; then
                 exec "$SYNC_KEYRING_UTILITY" $backendopt get "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
             else
                 exec "$SYNC_ASKPASS" "$@"
-                exit $?
             fi
+            exit $?
             ;;
     esac
 fi
 
-# Find script name
-scriptdir="$(dirname "$0")"
-scriptname="$(basename "$0")"
-
-# Use secure umask
-umask 077
-
 # Show error and exit
 error () {
-    echo "ERROR: $*" 1>&2
+    [ -z "$*" ] || echo "ERROR: $*" 1>&2
     exit 1
 }
+
+# Find script name
+scriptdir="$(dirname "$0")" || error
+scriptname="$(basename "$0")" || error
+
+# Use secure umask
+umask 077 || error
 
 # Prints help and exits
 print_help () {
@@ -123,6 +120,7 @@ check_tools () {
     [ -z "$verbose" ] || echo 'Checking tools...'
     type wget > /dev/null 2>&1 || error "Required tools missing: wget"
     type lockfile-create > /dev/null 2>&1 || error "Required tools missing: lockfile-progs (lockfile-create, etc.)"
+    type sha256sum > /dev/null 2>&1 || error "Required tools missing: sha256sum"
     if [ -n "$SYNC_REMOTE_USER" ]; then
         [ -z "$SYNC_KEYRING_UTILITY" ] || type "$SYNC_KEYRING_UTILITY" > /dev/null 2>&1 || error "Keyring utility not found or not executable: $SYNC_KEYRING_UTILITY (Python keyring)"
         [ -z "$SYNC_ASKPASS" ] || type "$SYNC_ASKPASS" > /dev/null 2>&1 || error "Credentials providing script not found or not executable: $SYNC_ASKPASS"
@@ -142,6 +140,24 @@ select_file () {
         fileremote="$(basename "$filelocal")"
     fi
     fileremote="$SYNC_REMOTE_BASE_URL$fileremote"
+}
+
+# Lock selected file for processing (locally)
+lock_file () {
+    local ret lf
+    ret=0
+    mkdir -p "$SYNC_STATE_DIR/$selectedfile" || ret=$?
+    lf="$SYNC_STATE_DIR/$selectedfile/lock"
+    [ $ret -ne 0 ] || lockfile-create -p -r 2 -l "$lf" || ret=$?
+    [ $ret -ne 0 ] || lockfile="$lf"
+    [ $ret -eq 0 ] || echo "ERROR: Failed to lock file: $selectedfile" 1>&2
+    return $ret
+}
+
+# Unlock selected file (locally)
+unlock_file () {
+    [ -z "$lockfile" ] || lockfile-remove -l "$lockfile"
+    lockfile=
 }
 
 # Load configuration
@@ -194,7 +210,7 @@ ask_password () {
         passwd=
         printf '%s' "$prompt" 1>&2
         stty -echo
-        read passwd || true
+        read passwd
         printf '\n' 1>&2
         stty echo
         echo "$passwd"
@@ -235,34 +251,40 @@ wget_do () {
 # Upload file to remote using PUT
 webdav_put () {
     [ -z "$verbose" ] || echo "Uploading: $filelocal --> $fileremote"
-    wget_do -t 3 -O /dev/null --method=PUT --body-file="$filelocal" "$fileremote" || return 1
+    wget_do -t 3 -O /dev/null --method=PUT --body-file="$filelocal" "$fileremote" || { echo "ERROR: Upload failed: $fileremote" 1>&2; return 1; }
     [ -z "$verbose" ] || echo 'Upload complete.'
 }
 
 # Download file from remote using GET
 webdav_get () {
+    local ret
     [ -z "$verbose" ] || echo "Downloading: $fileremote --> $filelocal"
-    tmpfile="$(mktemp "$(dirname "$filelocal")/.$(basename "$filelocal").XXXXXX")"
-    wget_do -t 3 -O "$tmpfile" --method=GET "$fileremote" || return 1
+    ret=0
+    tmpfile="$(mktemp "$(dirname "$filelocal")/.$(basename "$filelocal").XXXXXX")" || ret=$?
+    [ $ret -ne 0 ] || wget_do -t 3 -O "$tmpfile" --method=GET "$fileremote" || ret=$?
     if [ -e "$filelocal" ]; then
-        chmod --reference="$filelocal" "$tmpfile"
+        [ $ret -ne 0 ] || chmod --reference="$filelocal" "$tmpfile" || ret=$?
     fi
-    mv "$tmpfile" "$filelocal"
-    [ -z "$verbose" ] || echo 'Download complete.'
+    [ $ret -ne 0 ] || mv "$tmpfile" "$filelocal" || ret=$?
+    [ $ret -eq 0 ] || rm -f "$tmpfile"
+    tmpfile=
+    [ $ret -ne 0 -o -z "$verbose" ] || echo 'Download complete.'
+    [ $ret -eq 0 ] || echo "ERROR: Download failed: $fileremote" 1>&2
+    return $ret
 }
 
 # Lock selected file
 webdav_lock () {
+    local ret
     [ -z "$verbose" ] || echo "Locking: $fileremote"
-    tmpfile="$(mktemp -t "$scriptname.XXXXXX")"
-    wget_do -t 3 -O /dev/null -S --method=LOCK --header='Depth: 0' --header='Timeout: Second-300' --header='Content-Type: application/xml; charset="utf-8"' --body-data='<?xml version="1.0" encoding="utf-8" ?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>' "$fileremote" 2> "$tmpfile"
-    ret=$?
-    if [ $ret -eq 0 ]; then
-        locktoken="$(cat "$tmpfile" | grep -E '^\s*Lock-Token:' | sed -e 's/^\s*Lock-Token:\s*//')"
-    fi
+    ret=0
+    tmpfile="$(mktemp -t "$scriptname.XXXXXX")" || ret=$?
+    [ $ret -ne 0 ] || wget_do -t 3 -O /dev/null -S --method=LOCK --header='Depth: 0' --header='Timeout: Second-300' --header='Content-Type: application/xml; charset="utf-8"' --body-data='<?xml version="1.0" encoding="utf-8" ?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>' "$fileremote" 2> "$tmpfile" || ret=$?
+    [ $ret -ne 0 ] || locktoken="$(cat "$tmpfile" | grep -E '^\s*Lock-Token:' | sed -e 's/^\s*Lock-Token:\s*//')"
     rm -f "$tmpfile"
     tmpfile=
-    [ "$ret" -eq 0 -a -n "$locktoken" ] || return 1
+    [ "$ret" -eq 0 -a -n "$locktoken" ] \
+        || { echo "ERROR: Locking failed: $fileremote" 1>&2; return 1; }
 }
 
 # Unlock selected file
@@ -272,16 +294,17 @@ webdav_unlock () {
     [ -z "$verbose" ] || echo "Unlocking: $fileremote"
     lt="$locktoken"
     locktoken=
-    wget_do -t 3 -O /dev/null --method=UNLOCK --header="Lock-Token: $lt" "$fileremote" || return 1
+    wget_do -t 3 -O /dev/null --method=UNLOCK --header="Lock-Token: $lt" "$fileremote" \
+        || { echo "ERROR: Unlocking failed: $fileremote" 1>&2; return 1; }
 }
 
 # Do syncing of selected file
 webdav_sync () {
     [ -z "$verbose" ] || echo "Synchronizing: $filelocal <--> $fileremote"
-    [ -n "$skiplocking" ] || webdav_lock || { echo "ERROR: Locking failed: $fileremote" 1>&2; return 1; }
+    [ -n "$skiplocking" ] || webdav_lock || return 1
 
 
-    [ -n "$skiplocking" ] || webdav_unlock || echo "WARNING: Unlocking failed: $fileremote" 1>&2
+    [ -n "$skiplocking" ] || webdav_unlock
 }
 
 # Command: print help
@@ -355,6 +378,7 @@ cmd_config () {
 # How long to keep backup copies in days (default value)
 #SYNC_BACKUP_DAYS=30
 EOS
+    [ $? -eq 0 ] || error "Failed to create a configuration file"
     echo "Example configuration file was created: $conf"
     echo "Edit its contents as necessary."
     echo "Then run \"$scriptname auth\" if you want to setup keyring authentication."
@@ -371,23 +395,32 @@ cmd_auth () {
     if [ -n "$SYNC_KEYRING_BACKEND" ]; then
         backendopt="-b $SYNC_KEYRING_BACKEND"
     fi
-    ask_password | "$SYNC_KEYRING_UTILITY" $backendopt set "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER"
+    ask_password | "$SYNC_KEYRING_UTILITY" $backendopt set "$SYNC_REMOTE_TARGET" "$SYNC_REMOTE_USER" || error "Authentication failed"
 }
 
 # Command: sync
 cmd_sync () {
-    local f
+    local f ret errors
     check_cmd_args $# 0 1
     load_configuration
     check_tools
     if [ $# -ge 1 ]; then
         select_file "$1"
+        lock_file || error
         webdav_sync || error "Synchronization failed: $1"
+        unlock_file
     else
         errors=
         for f in $SYNC_FILES; do
             select_file "$f"
-            webdav_sync || {
+            ret=0
+            if lock_file; then
+                webdav_sync || ret=$?
+                unlock_file
+            else
+                ret=1
+            fi
+            [ $ret -eq 0 ] || {
                 echo "ERROR: Synchronization failed: $f" 1>&2
                 errors=true
             }
@@ -398,7 +431,7 @@ cmd_sync () {
 
 # Command: sync-repeat
 cmd_syncrepeat () {
-    local f
+    local f ret errors
     check_cmd_args $# 0 0
     load_configuration
     check_tools
@@ -407,12 +440,19 @@ cmd_syncrepeat () {
         errors=
         for f in $SYNC_FILES; do
             select_file "$f"
-            webdav_sync || {
+            ret=0
+            if lock_file; then
+                webdav_sync || ret=$?
+                unlock_file
+            else
+                ret=1
+            fi
+            [ $ret -eq 0 ] || {
                 echo "ERROR: Synchronization failed: $f" 1>&2
                 errors=true
             }
         done
-        [ -z "$errors" ] || echo "ERROR: Synchronization failed for one or more files"
+        [ -z "$errors" ] || echo "ERROR: Synchronization failed for one or more files" 1>&2
         [ -z "$verbose" ] || echo "Synchronization completed at $(date '+%Y-%m-%d %H:%M:%S')."
         sleep $(( $SYNC_REPEAT_MINUTES * 60 ))
     done
@@ -424,7 +464,9 @@ cmd_put () {
     load_configuration
     check_tools
     select_file "$1"
-    webdav_put || error "Upload failed"
+    lock_file || error
+    webdav_put || error
+    unlock_file
 }
 
 # Command: get file from remote
@@ -433,14 +475,17 @@ cmd_get () {
     load_configuration
     check_tools
     select_file "$1"
-    webdav_get || error "Download failed"
+    lock_file || error
+    webdav_get || error
+    unlock_file
 }
 
 # Cleanup for temporary files and directories
 tmpdir=
 tmpfile=
 locktoken=
-trap '[ -z "$locktoken" ] || webdav_unlock; [ -z "$tmpdir" ] || rm -rf "$tmpdir"; [ -z "$tmpfile" ] || rm -f "$tmpfile"' 0
+lockfile=
+trap '[ -z "$lockfile" ] || lockfile-remove -l "$lockfile"; [ -z "$locktoken" ] || webdav_unlock; [ -z "$tmpdir" ] || rm -rf "$tmpdir"; [ -z "$tmpfile" ] || rm -f "$tmpfile"' 0
 
 # Perform the command
 case "$cmd" in
