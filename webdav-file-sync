@@ -52,7 +52,7 @@ commands:
   auth          initialize keyring authencation
   sync          synchronize all configured files once
   sync FILE     synchronize the configured FILE once
-  sync-repeat   synchronize all configured files repeatedly until killed
+  syncrepeat    synchronize all configured files repeatedly until killed
   put FILE      upload configured FILE overwriting any remote changes
   get FILE      download configured FILE overwriting any local changes
 
@@ -396,6 +396,28 @@ cmd_sync () {
     fi
 }
 
+# Command: sync-repeat
+cmd_syncrepeat () {
+    local f
+    check_cmd_args $# 0 0
+    load_configuration
+    check_tools
+    while true; do
+        [ -z "$verbose" ] || echo "Starting synchronization at $(date '+%Y-%m-%d %H:%M:%S')..."
+        errors=
+        for f in $SYNC_FILES; do
+            select_file "$f"
+            webdav_sync || {
+                echo "ERROR: Synchronization failed: $f" 1>&2
+                errors=true
+            }
+        done
+        [ -z "$errors" ] || echo "ERROR: Synchronization failed for one or more files"
+        [ -z "$verbose" ] || echo "Synchronization completed at $(date '+%Y-%m-%d %H:%M:%S')."
+        sleep $(( $SYNC_REPEAT_MINUTES * 60 ))
+    done
+}
+
 # Command: put file to remote
 cmd_put () {
     check_cmd_args $# 1 1
@@ -423,7 +445,7 @@ trap '[ -z "$locktoken" ] || webdav_unlock; [ -z "$tmpdir" ] || rm -rf "$tmpdir"
 # Perform the command
 case "$cmd" in
 
-    help|config|auth|sync|put|get)
+    help|config|auth|sync|syncrepeat|put|get)
         "cmd_$cmd" "$@"
         ;;
 
